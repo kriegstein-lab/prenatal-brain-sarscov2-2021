@@ -1,0 +1,557 @@
+---
+title: "Developing cortex slice culture, SARS-CoV2 project"
+author: "Neelroop Parikshak"
+output: html_notebook
+---
+
+The initial data in this analysis was paired-end RNA-seq performed through Genewiz. The data comprise three replicates of SARS-CoV2 RNA virus infection across two individuals along with matched controls, yielding 12 total samples. The transcriptome was directly quantified from the fastq files using kallisto:
+
+```{bash Map raw reads to transcriptome, eval=FALSE, include=FALSE}
+## idxpath = index from HS.GRCh38.release-104
+kallisto quant -i ${idxpath} -o ${outputdir}/${fbase} ${filepath}/${flistR1[$find]} ${filepath}/${flistR2[$find]} -t 48
+```
+
+
+## Preliminaries
+```{r Start with a clean slate}
+rm(list=ls())
+gc()
+```
+
+
+Load necessary packages
+```{r Load packages, message=FALSE, warning=FALSE, include=FALSE}
+library(tximport) ## Gene level quantifications from kallisto results
+library(biomaRt) ## Annotations
+
+## Differential expression
+library(edgeR) 
+library(limma) 
+
+## Gene ontology
+library(topGO)
+
+## Object manipulation
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(reshape2)
+
+## Plotting
+library(ggplot2)
+library(ggrepel)
+library(WGCNA) ## For heatmap function
+```
+
+```{r Obtain transcript annotation table}
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart=ensembl) ## from listDatasets()
+ensembl.transcripts <- getBM(attributes=c("ensembl_transcript_id","ensembl_gene_id","hgnc_symbol",
+                                        "transcript_biotype","transcript_source","transcript_version",
+                                        "transcript_start","transcript_end"),mart=ensembl)
+
+enst.version <- paste(ensembl.transcripts[,c(1)],ensembl.transcripts[,c(6)],sep=".")
+tx2gene <- data.frame(TXNAME=enst.version, GENEID=ensembl.transcripts[,c(2)])
+```
+
+## Gene level quantification
+Load & compile the data and collapse to gene level.
+```{r Quantify transcripts at gene level}
+#datdir <- "/Users/nnp/projects/lab/COVID/data"
+datdir <- "/Users/nnp/Box Sync/science/KriegsteinLab/projects/colab/COVID/data"
+files <- dir(datdir)
+fpaths <- file.path(datdir,files,"abundance.h5")
+names(fpaths) <- files
+
+txi.kallisto <- tximport(fpaths, type = "kallisto", tx2gene = tx2gene, ignoreAfterBar = TRUE)
+head(txi.kallisto$counts)
+```
+
+```{r Make a matrix of metadata}
+SARS_qPCR <- read.csv("../tables/0821 COVID slice culture sars RNA qpcr.csv")
+SARS_qPCR$SARS_E <- log2(SARS_qPCR$SARS_E) ## Log transform
+SARS_qPCR$SARS_N <- log2(SARS_qPCR$SARS_N) ## Log transform
+
+metadata <- str_split(colnames(txi.kallisto$counts),"-",simplify=TRUE)
+metadata <- data.frame(Sample=colnames(txi.kallisto$counts),
+                       ID=metadata[,1],
+                       Condition=metadata[,2],
+                       Replicate=metadata[,3])
+rownames(metadata) <- colnames(txi.kallisto$counts)
+
+metadata <- left_join(x = metadata,y=SARS_qPCR,by="Sample")
+
+metadata
+```
+
+
+## PCA analysis
+
+```{r Normalize count level data}
+cts <- txi.kallisto$counts
+normMat <- txi.kallisto$length
+
+# Obtaining per-observation scaling factors for length, adjusted to avoid changing the magnitude of the counts.
+normMat <- normMat/exp(rowMeans(log(normMat)))
+normCts <- cts/normMat
+
+# Computing effective library sizes from scaled counts, to account for composition biases between samples.
+eff.lib <- calcNormFactors(normCts) * colSums(normCts)
+
+# Combining effective library sizes with the length factors, and calculating offsets for a log-link GLM.
+normMat <- sweep(normMat, 2, eff.lib, "*")
+normMat <- log2(normMat)
+```
+
+```{r Principal component analysis}
+thisdat.PCA <- prcomp(normMat)
+topPC.thisdat <- thisdat.PCA$rotation[,1:10];
+varexp <- (thisdat.PCA$sdev)^2 / sum(thisdat.PCA$sdev^2)
+topvar <- varexp[1:10]
+colnames(topPC.thisdat) <- paste("PC\n",colnames(topPC.thisdat)," (",signif(100*topvar[1:10],2),"%)",sep="")
+```
+
+```{r PCA plots}
+PCplots <- data.frame(PC1=topPC.thisdat[,1],
+                      PC2=topPC.thisdat[,2],
+                      ID=metadata$ID,
+                      Condition=metadata$Condition)
+rownames(PCplots) <- metadata$Sample
+
+p1 <- ggplot(PCplots, aes(x=PC1, y=PC2, label=rownames(PCplots))) +
+  geom_point() + 
+  geom_text_repel()
+```
+
+```{r Visualize pca plot}
+plot(p1)
+```
+
+```{r Hierachical clustering plots}
+## Use 1 - (sample-to-sample correlation) as distance
+s.cor <- as.dist((1-cor(normMat)))
+h2 <- hclust(s.cor,"average")
+plot(h2)
+```
+
+## Differential expression analysis (case v control)
+For differential expression, treating condition as the independent covariate and replicates within individual as repeated observations.
+
+```{r Run limma-voom case-control model with blocking for replicates, include=FALSE}
+## Filter genes
+y <- DGEList(txi.kallisto$counts)
+keep <- filterByExpr(y)
+y <- y[keep, ]
+
+## Design matrix
+y <- calcNormFactors(y,method="RLE")                  
+design <- model.matrix(~0+Condition, data=metadata)
+v <- voom(y,design,plot=TRUE)
+
+## Account for replicates
+corfit <- duplicateCorrelation(v,design,block=metadata$ID)
+corfit$consensus
+
+fit <- lmFit(v,design,block=metadata$ID,correlation=corfit$consensus)
+contrasts <- makeContrasts(ConditionMOI-ConditionControl, levels=design)
+contr.fit <- eBayes(contrasts.fit(fit,contrasts))
+
+```
+
+```{r Output DGE results to a table}
+## Get gene names and assemble table
+FDR <- p.adjust(as.numeric(contr.fit$p.value),method="BH") ## Benjamini-Hochberg false discovery rate for multiple corrections
+resultsTab <- data.frame(gene=rownames(contr.fit$coefficients),
+                         diff=as.numeric(contr.fit$coefficients),
+                         pval=as.numeric(contr.fit$p.value),
+                         fdr=FDR)
+rownames(resultsTab) <- resultsTab[,"gene"]
+resultsTab[,"gene"] <- ensembl.transcripts[match(resultsTab$gene,ensembl.transcripts$ensembl_gene_id),
+                                           "hgnc_symbol"]
+```
+
+
+```{r candidate_lists}
+## Astrocyte reactivity
+astro.react <- c('CHI3L1','COL8A2','SASH3','IFITM3')
+## Microglia react
+micro.react <- c('SLC11A1','SPP1','CD14','CD68','APOE','ITGAX','CD14','TREM2')
+## Additional genes
+add.genes <- c('IFI30','IFI6','IFI44','IFI16','TNFAIP8L3','CXCL16','IL1RN','CD4')
+
+```
+
+```{r Output DGE results to a table}
+# add a column of NAs
+resultsTab$diffexpressed <- "NO"
+resultsTab$diffexpressed[resultsTab$diff > log2(2) & resultsTab$fdr < 0.1] <- "UP"
+resultsTab$diffexpressed[resultsTab$diff < log2(0.5) & resultsTab$fdr < 0.1] <- "DOWN"
+table(resultsTab$diffexpressed)
+
+# Create a new column "delabel" to de, that will contain the name of genes differentially expressed (NA in case they are not)
+resultsTab$delabel <- NA
+resultsTab$labcol <- NA
+
+## Mark microglial genes
+genefilt <- match(astro.react,resultsTab$gene)
+resultsTab$delabel[genefilt] <- resultsTab$gene[genefilt]
+resultsTab$labcol[genefilt] <- "red" 
+
+## Mark astrocyte genes
+genefilt <- match(micro.react,resultsTab$gene)
+resultsTab$delabel[genefilt] <- resultsTab$gene[genefilt] 
+resultsTab$labcol[genefilt] <- "orange" 
+
+## Mark downregulated genes
+genefilt <- resultsTab$diff < log2(0.33) & resultsTab$fdr < 0.01 ## Arbitrary to highlight top 5 downregulated
+resultsTab$delabel[genefilt] <- resultsTab$gene[genefilt] ## Arbitrary up/down cut-off for labeling purposes
+resultsTab$labcol[genefilt] <- "blue" 
+
+## Compile DGE results
+exprTable <- cbind(resultsTab,v[match(rownames(resultsTab),rownames(v)),])
+
+```
+
+
+```{r Volcano plot }
+# plot adding up all layers we have seen so far
+ggplot(data=resultsTab, aes(x=diff, y=-log10(fdr),
+                            col=labcol, label=delabel)) +
+  geom_point() + 
+  theme_minimal() +
+  geom_text_repel() +
+  scale_color_manual(values=c("blue", "red", "orange","grey")) +
+  geom_vline(xintercept=c(0), col="black") +
+  geom_hline(yintercept=-log10(0.1), col="red") +
+  geom_hline(yintercept=0, col="black") +
+  labs(title = "Volcano plot of differential expression",
+       x="log2(fold change)",
+       y="-log10(FDR)") +
+  xlim(-4,4) + ylim (-0.2,4)
+```
+
+## Geme Ontology Analysis of DGE set
+
+```{r GO analysis settings}
+selFun <- function(val) { return (as.numeric(val) == 1) }
+
+## Background gene set
+allgenes <- unique(resultsTab$gene)
+geneset <- rep(0,length(allgenes))
+names(geneset) <- allgenes
+GOoutput <- vector(mode = "list", length=2)
+```
+
+
+```{r GO analysis run, echo=TRUE}
+## Get each gene list
+for (thisdir in (c("up","down"))) {
+  if (thisdir == "up") {
+    keep <- resultsTab$diffexpressed == "UP"
+  } else {
+    keep <- resultsTab$diffexpressed == "DOWN"
+  }
+  tomark <- unique(resultsTab$gene[keep])
+  thisset <- geneset
+  thisset[names(thisset) %in% tomark] <- 1
+  
+  sampleGOdata <- new("topGOdata",
+                      description = "Simple session", ontology = "BP",
+                      allGenes = thisset, geneSel = selFun,
+                      nodeSize = 10,
+                      annot=annFUN.org, mapping="org.Hs.eg.db", ID = "symbol")
+  
+  resultFisher.classic <- runTest(sampleGOdata, algorithm = "classic", statistic = "fisher")
+  resultFisher.elim <- runTest(sampleGOdata, algorithm = "elim", statistic = "fisher")
+  
+  theseresults <- GenTable(sampleGOdata, classicFisher = resultFisher.classic,
+                           elimFisher = resultFisher.elim, orderBy = "elimFisher",
+                           ranksOf = "classicFisher", topNodes = 30, numChar = 1000)
+  
+  AnnotatedGenes = lapply(theseresults$GO.ID, function(x) as.character(unlist(genesInTerm(object = sampleGOdata, whichGO = x)))) # list containg genes annotated to significant GO terms
+  SignificantGenes = lapply(AnnotatedGenes, function(x) intersect(x, tomark))
+  
+  topTerms <- theseresults[1:10,c("Term","elimFisher")]
+  
+  topTerms[,"elimFisher"] <- -log10(as.numeric(topTerms[,"elimFisher"]))
+  names(topTerms)[2] <- "sig"
+  topTerms[,1] <- str_wrap(topTerms[,1] ,width = 40)
+  
+  p1 <- ggplot(topTerms, aes(x=Term, y=sig)) +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+    aes(x = reorder(Term, sig)) +
+    geom_hline(yintercept = 2) +
+    geom_bar(stat='identity', fill="darkblue", width=0.5) +
+    ggtitle(paste(thisdir,sum(thisset),"genes",sep=" ")) +
+    theme(plot.title = element_text(size=10),
+          axis.text=element_text(size=10)) +
+    xlab("GO term") + ylab("-log10(P value)") +
+    coord_flip()
+  
+  plot(p1)
+    
+  for (n in 1:nrow(topTerms)) {
+    topTerms$Term[n] <- str_wrap(paste(topTerms$Term[n]," (",paste(SignificantGenes[[n]],sep="",collapse=", "),")"),40)
+  }
+  
+  p2 <- ggplot(topTerms, aes(x=Term, y=sig)) +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+    aes(x = reorder(Term, sig)) +
+    geom_hline(yintercept = 2) +
+    geom_bar(stat='identity', fill="darkblue", width=0.5) +
+    ggtitle(paste(thisdir,sum(thisset),"genes",sep=" ")) +
+    theme(plot.title = element_text(size=10),
+          axis.text=element_text(size=10)) +
+    xlab("GO term") + ylab("-log10(P value)") +
+    coord_flip()
+  
+  plot(p2)
+}
+
+
+
+```
+
+## Genes with "dosage sensitivity" to viral genes
+```{r sarscov2 correlations}
+## Subset data to COVID infections only
+keep.samp <- metadata$Condition=="MOI"
+sub.metadata <- metadata[keep.samp,]
+sub.expr <- v$E[,keep.samp]
+
+## Correlate all genes' expression to COVID gene expression using qPCR of two different SARS-CoV2 genes
+SARSE.cor <- cor(x=as.numeric(sub.metadata$SARS_E),
+              y=t(as.matrix(sub.expr)),
+              method="pearson")
+SARSN.cor <- cor(x=as.numeric(sub.metadata$SARS_N),
+              y=t(as.matrix(sub.expr)),
+              method="pearson")
+
+keep.hicor <- SARSE.cor > 0.8 & SARSN.cor > 0.8
+
+keep.anticor <- SARSE.cor < -0.8 & SARSN.cor < -0.8
+
+resultsTab$SARSEcor <- as.numeric(SARSE.cor)
+resultsTab$SARSNcor <- as.numeric(SARSN.cor)
+resultsTab$hicor <- as.numeric(keep.hicor)
+resultsTab$hianticor <- as.numeric(keep.anticor)
+
+```
+
+```{r GO analysis run, echo=TRUE}
+## Get each gene list
+for (thisdir in (c("viralexprcor","viralexpranticor"))) {
+  if (thisdir == "viralexprcor") {
+    keep <- resultsTab$hicor == 1
+  } else {
+    keep <- resultsTab$hianticor == 1
+  }
+  tomark <- unique(resultsTab$gene[keep])
+  thisset <- geneset
+  thisset[names(thisset) %in% tomark] <- 1
+  
+  sampleGOdata <- new("topGOdata",
+                      description = "Simple session", ontology = "BP",
+                      allGenes = thisset, geneSel = selFun,
+                      nodeSize = 10,
+                      annot=annFUN.org, mapping="org.Hs.eg.db", ID = "symbol")
+  
+  resultFisher.classic <- runTest(sampleGOdata, algorithm = "classic", statistic = "fisher")
+  resultFisher.elim <- runTest(sampleGOdata, algorithm = "elim", statistic = "fisher")
+  
+  theseresults <- GenTable(sampleGOdata, classicFisher = resultFisher.classic,
+                           elimFisher = resultFisher.elim, orderBy = "elimFisher",
+                           ranksOf = "classicFisher", topNodes = 30, numChar = 1000)
+  
+  AnnotatedGenes = lapply(theseresults$GO.ID, function(x) as.character(unlist(genesInTerm(object = sampleGOdata, whichGO = x)))) # list containg genes annotated to significant GO terms
+  SignificantGenes = lapply(AnnotatedGenes, function(x) intersect(x, tomark))
+  
+  topTerms <- theseresults[1:10,c("Term","elimFisher")]
+  
+  topTerms[,"elimFisher"] <- -log10(as.numeric(topTerms[,"elimFisher"]))
+  names(topTerms)[2] <- "sig"
+  topTerms[,1] <- str_wrap(topTerms[,1] ,width = 40)
+  
+  p1 <- ggplot(topTerms, aes(x=Term, y=sig)) +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+    aes(x = reorder(Term, sig)) +
+    geom_hline(yintercept = 2) +
+    geom_bar(stat='identity', fill="darkblue", width=0.5) +
+    ggtitle(paste(thisdir,sum(thisset),"genes",sep=" ")) +
+    theme(plot.title = element_text(size=10),
+          axis.text=element_text(size=10)) +
+    xlab("GO term") + ylab("-log10(P value)") +
+    coord_flip()
+  
+  plot(p1)
+
+  for (n in 1:nrow(topTerms)) {
+    topTerms$Term[n] <- str_wrap(paste(topTerms$Term[n]," (",paste(SignificantGenes[[n]],sep="",collapse=", "),")"),40)
+  }
+  
+  p2 <- ggplot(topTerms, aes(x=Term, y=sig)) +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+    aes(x = reorder(Term, sig)) +
+    geom_hline(yintercept = 2) +
+    geom_bar(stat='identity', fill="darkblue", width=0.5) +
+    ggtitle(paste(thisdir,sum(thisset),"genes",sep=" ")) +
+    theme(plot.title = element_text(size=10),
+          axis.text=element_text(size=10)) +
+    xlab("GO term") + ylab("-log10(P value)") +
+    coord_flip()
+  
+  plot(p2)
+}
+
+
+
+```
+
+### Process reactive astrocyte and reactive microglia datasets and create gene lists for enrichment analysis
+These datasets were obtained from:
+Drager et al: https://doi.org/10.1101/2021.06.16.448639
+Leng et al: https://doi.org/10.1101/2021.08.23.457400
+
+```{r reactive glia markers}
+reactive.mat <- resultsTab$gene
+
+## Drager et al LPS microglia
+tmptab <- read.csv("../tables/reference/LPS_microglia_Drager_S2.csv")
+tomark <- match(reactive.mat,
+                tmptab$gene[tmptab$log2FoldChange > 2 & tmptab$padj < 0.05])
+reactive.mat <- cbind(reactive.mat,!is.na(tomark))
+colnames(reactive.mat) <- c("genes","LPS.microglia")
+
+## Leng et al ILa/TNF/C1q astrocytes
+tmptab <- read.csv("../tables/reference/ILa-TNF-C1q_astrocytes_Leng_S1.csv")
+tomark <- match(reactive.mat[,1],
+                tmptab$gene[tmptab$log2FoldChange > 2 & tmptab$padj < 0.05])
+ILa_TNF_C1q.astrocytes <- !is.na(tomark)
+reactive.mat <- cbind(reactive.mat,ILa_TNF_C1q.astrocytes)
+
+## Drager et al CROP-seq, table S5 (cluster membership)
+sheet.list <- readxl::excel_sheets("../tables/reference/Drager_S5.xlsx")
+xlstmp <- readxl::read_excel("../tables/reference/Drager_S5.xlsx", sheet = sheet.list)
+cluster.list <- names(table(xlstmp$cluster))
+crop.mat <- matrix(NA,nrow=nrow(reactive.mat),ncol=length(cluster.list))
+colnames(crop.mat) <- paste("Drager_MG_C",cluster.list,sep="")
+
+for (nlist in cluster.list) {
+  crop.sub <- xlstmp$gene[xlstmp$cluster==nlist]
+  
+  tomark <- match(reactive.mat[,1],
+                crop.sub)
+  crop.mat[,cluster.list==nlist] <- !is.na(tomark)
+}
+
+reactive.mat <- cbind(reactive.mat,crop.mat)
+
+## Leng t al CROP-seq, table S8 (cluster membership)
+sheet.list <- readxl::excel_sheets("../tables/reference/Leng_S8.xlsx")
+xlstmp <- readxl::read_excel("../tables/reference/Leng_S8.xlsx", sheet = sheet.list[1])
+cluster.list <- names(table(xlstmp$module))
+crop.mat <- matrix(NA,nrow=nrow(reactive.mat),ncol=length(cluster.list))
+colnames(crop.mat) <- paste("Leng_astro_",cluster.list,sep="")
+
+for (nlist in cluster.list) {
+  crop.sub <- xlstmp$gene[xlstmp$module==nlist]
+  
+  tomark <- match(reactive.mat[,1],
+                crop.sub)
+  crop.mat[,cluster.list==nlist] <- !is.na(tomark)
+}
+
+reactive.mat <- cbind(reactive.mat,crop.mat)
+
+```
+
+
+```{r ORA function, include=FALSE}
+OR <- function(q,k,m,t) {
+        q #<-  ## Intersection of test list and reference list, aka number of white balls drawn
+        m #<-  ## All genes in reference list, aka number of draws
+        k #<-  ## All genes in test list, aka number white balls
+        t #<-  ## Total number of genes assessed, aka black plus white balls
+
+        fisher.out <- fisher.test(matrix(c(q, k-q, m-q, t-m-k+q), 2, 2),conf.int=TRUE)
+        OR <- fisher.out$estimate
+        pval <- fisher.out$p.value
+         upCI <- fisher.out$conf.int[1]
+      downCI <- fisher.out$conf.int[2]
+
+        output <- c(OR,pval,upCI,downCI)
+      	names(output) <- c("OR","Fisher p","-95%CI","+95%CI")
+        return(output)
+      }
+
+      ## count overlaps and run the analysis
+     ORA <- function(testpath,refpath,testbackground,refbackground) {
+ 	 q <- length(intersect(testpath,refpath)) ## overlapped pathway size
+  	k <- length(intersect(refpath,testbackground))  ## input gene set
+  	m <- length(intersect(testpath,refbackground)) ## input module
+ 	 t <- length(intersect(testbackground,refbackground)) ## Total assessed background (intersect reference and test backgrounds)
+
+ 	 empvals <- OR(q,k,m,t)
+
+  	tmpnames <- names(empvals)
+ 	 empvals <- as.character(c(empvals,q,k,m,t,100*signif(q/k,3)))
+ 	 names(empvals) <- c(tmpnames,"Overlap","Reference List","Input List","Background","% List Overlap")
+  	return(empvals)
+  }
+```
+
+
+```{r run_enrichments, fig.height=3, fig.width=5}
+testsets <- data.frame(reactive.mat[,-c(1)])
+
+## Rearrange
+testsets <- testsets[,c(1,3:11,2,12:21)]
+
+refsets <- data.frame(UpCOVID = resultsTab$diffexpressed =="UP",
+                      DownCOVID = resultsTab$diffexpressed =="DOWN",
+                      CorSARSdose = resultsTab$hicor == 1,
+                      AnticorSARSdose = resultsTab$hianticor == 1)
+
+setnames <- colnames(refsets)
+
+ORmat <- Pmat <- matrix(NA,nrow=length(setnames),ncol=ncol(testsets))
+rownames(ORmat) <- rownames(Pmat) <- setnames
+colnames(ORmat) <- colnames(Pmat)<- colnames(testsets)
+
+for(j in 1:nrow(ORmat)){
+  refset <- resultsTab$gene[refsets[,j]]
+  
+  for (i in 1:ncol(ORmat)){
+    testset <- reactive.mat[,c(1)][as.logical(testsets[,i])]
+
+    testbackground <- resultsTab$gene
+    refbackground <- resultsTab$gene
+
+    oraout <- ORA(testset,refset,testbackground,refbackground)
+    
+    ORmat[j,i] <- as.numeric(oraout[1])
+    Pmat[j,i] <- as.numeric(oraout[2])
+  }
+}
+
+dispMat <- -log10(as.matrix(Pmat))*sign(log2(as.matrix(ORmat+0.01))) ## You can change this to be just log2(Bmat) if you want the color to reflect the odds ratios
+
+## Use the text function with the FDR filter in labeledHeatmap to add asterisks, e.g.
+txtMat <- signif(ORmat,2)
+FDRmat <- matrix(p.adjust(Pmat,method="BH"),nrow=nrow(Pmat),ncol=ncol(Pmat))
+txtMat[FDRmat > 0.01] <- ""
+
+## Plot how the modules match up between what is computed here, and what is provided in the supplement
+#par(mfrow=c(1,1))
+labeledHeatmap(Matrix=ORmat,
+               yLabels= rownames(ORmat),
+               yColorLabels=F,
+               xLabels= colnames(ORmat),
+               colors=blueWhiteRed(100),
+               textMatrix = txtMat,
+               cex.lab.x=0.8,
+               zlim=c(-25,25),
+               main="Signed -log10(p-value) Heatmap")
+
+
+```
