@@ -547,7 +547,7 @@ labeledHeatmap(Matrix=ORmat,
                textMatrix = txtMat,
                cex.lab.x=0.8,
                zlim=c(-25,25),
-               main="Signed -log10(p-value) Heatmap")
+               main="Odds-ratio heatmap (showing enrichments with FDR < 0.01 only)")
 
 
 ```
