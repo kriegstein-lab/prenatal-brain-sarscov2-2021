@@ -4,7 +4,7 @@ author: "Neelroop Parikshak"
 output: html_notebook
 ---
 
-The initial data in this analysis was paired-end RNA-seq performed through Genewiz. The data comprise three replicates of SARS-CoV2 RNA virus infection across two individuals along with matched controls, yielding 12 total samples. The transcriptome was directly quantified from the fastq files using kallisto:
+The initial data in this analysis was 150bp paired-end RNA-seq performed through Genewiz. The data comprise three replicates of SARS-CoV2 RNA virus infection across two individuals along with matched controls, yielding 12 total samples. The transcriptome was directly quantified from the fastq files using kallisto:
 
 ```{bash Map raw reads to transcriptome, eval=FALSE, include=FALSE}
 ## idxpath = index from HS.GRCh38.release-104
@@ -55,7 +55,7 @@ tx2gene <- data.frame(TXNAME=enst.version, GENEID=ensembl.transcripts[,c(2)])
 ```
 
 ## Gene level quantification
-Load & compile the data and collapse to gene level.
+Load & compile the data and collapse to gene level from hd5 files (output from kallisto).
 ```{r Quantify transcripts at gene level}
 #datdir <- "/Users/nnp/projects/lab/COVID/data"
 datdir <- "/Users/nnp/Box Sync/science/KriegsteinLab/projects/colab/COVID/data"
@@ -85,7 +85,7 @@ metadata
 ```
 
 
-## PCA analysis
+## Principal component analysis
 
 ```{r Normalize count level data}
 cts <- txi.kallisto$counts
@@ -230,8 +230,6 @@ ggplot(data=resultsTab, aes(x=diff, y=-log10(fdr),
   xlim(-4,4) + ylim (-0.2,4)
 ```
 
-## Geme Ontology Analysis of DGE set
-
 ```{r GO analysis settings}
 selFun <- function(val) { return (as.numeric(val) == 1) }
 
@@ -312,7 +310,7 @@ for (thisdir in (c("up","down"))) {
 
 ```
 
-## Genes with "dosage sensitivity" to viral genes
+## "Dosage sensitivity" analysis
 ```{r sarscov2 correlations}
 ## Subset data to COVID infections only
 keep.samp <- metadata$Condition=="MOI"
@@ -406,8 +404,8 @@ for (thisdir in (c("viralexprcor","viralexpranticor"))) {
 
 
 ```
-
-### Process reactive astrocyte and reactive microglia datasets and create gene lists for enrichment analysis
+## Cell state analysis
+Process reactive astrocyte and reactive microglia datasets and create gene lists for enrichment analysis
 These datasets were obtained from:
 Drager et al: https://doi.org/10.1101/2021.06.16.448639
 Leng et al: https://doi.org/10.1101/2021.08.23.457400
@@ -533,8 +531,6 @@ for(j in 1:nrow(ORmat)){
     Pmat[j,i] <- as.numeric(oraout[2])
   }
 }
-
-dispMat <- -log10(as.matrix(Pmat))*sign(log2(as.matrix(ORmat+0.01))) ## You can change this to be just log2(Bmat) if you want the color to reflect the odds ratios
 
 ## Use the text function with the FDR filter in labeledHeatmap to add asterisks, e.g.
 txtMat <- signif(ORmat,2)
